@@ -1,0 +1,59 @@
+---
+title: "Naive Bayes Model"
+format:
+  html:
+    code-fold: true
+---
+
+```{r}
+library(tidyverse)
+library(e1071)
+
+raw_conf_data <- read.csv("conference_matches_raw.csv")
+
+core_columns <- c(
+  "match_id", "set_number", "point_id", "file_line_number",
+  "home_team", "visiting_team", "team",
+  "skill", "evaluation_code", "evaluation", "special_code",
+  "point", "point_won_by", "winning_attack", "serving_team",
+  "home_team_score", "visiting_team_score",
+  "home_score_start_of_point", "visiting_score_start_of_point"
+)
+conference_data <- raw_conf_data |> select(all_of(core_columns))
+
+source("live_set_models.R")
+```
+
+```{r}
+x_train <- model.matrix(skill_formula, train_data)[, -1, drop = FALSE]
+x_test <- model.matrix(skill_formula, test_data)[, -1, drop = FALSE]
+stopifnot(nrow(x_train) == nrow(train_data), nrow(x_test) == nrow(test_data))
+
+varying <- apply(x_train, 2, sd) > 0
+x_train <- x_train[, varying, drop = FALSE]
+x_test <- x_test[, varying, drop = FALSE]
+
+x_train_scaled <- scale(x_train, center = colMeans(x_train), scale = apply(x_train, 2, sd))
+x_test_scaled <- scale(x_test, center = colMeans(x_train), scale = apply(x_train, 2, sd))
+y_train <- factor(train_data$home_set_win, levels = c(0, 1))
+```
+
+```{r}
+nb_fit <- naiveBayes(x = x_train_scaled, y = y_train)
+nb_probability <- predict(nb_fit, x_test_scaled, type = "raw")[, "1"]
+
+nb_results <- test_data |>
+  mutate(
+    win_probability = nb_probability,
+    brier = (win_probability - home_set_win)^2,
+    clipped = pmin(pmax(win_probability, 1e-8), 1 - 1e-8),
+    log_loss = -(home_set_win * log(clipped) + (1 - home_set_win) * log(1 - clipped))
+  )
+
+nb_summary <- nb_results |>
+  group_by(match_id, set_number) |>
+  summarise(brier = mean(brier), log_loss = mean(log_loss), .groups = "drop") |>
+  summarise(model = "naive_bayes", test_sets = n(), brier = mean(brier), log_loss = mean(log_loss))
+
+bind_rows(nb_summary, model_comparison)
+```
