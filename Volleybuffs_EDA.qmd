@@ -1,0 +1,406 @@
+---
+title: "Volleybuffs_EDA"
+format: html
+---
+#### Loading Libraries
+```{r,message =FALSE, warning=FALSE,echo=FALSE}
+library(tidyverse)
+library(ggplot2)
+```
+
+
+## Bringing in the data
+
+```{r}
+#raw_data <- read.csv("~/Documents/Academic/STAT4640_Stats_Capstone/Data/dirty_all_matches_raw.csv")
+raw_conf_data <- read.csv("~/Documents/Academic/STAT4640_Stats_Capstone/Data/conference_matches_raw.csv")
+
+# Keep the raw data intact; use this smaller table for metric construction.
+core_columns <- c(
+  "match_id", "set_number", "point_id", "file_line_number",
+  "home_team", "visiting_team", "team",
+  "skill", "evaluation_code", "evaluation", "special_code",
+  "point", "point_won_by", "winning_attack", "serving_team",
+  "home_team_score", "visiting_team_score",
+  "home_score_start_of_point", "visiting_score_start_of_point"
+)
+conference_data <- raw_conf_data |>
+  select(all_of(core_columns))
+head(conference_data)
+```
+
+`conference_data` excludes player names, IDs, jersey numbers, lineup fields,
+video/timestamp fields, coordinates, and export metadata. Match, set, rally,
+team, and source-line identifiers remain for grouping and checking records;
+they are not automatically model predictors. `special_code` remains because
+it describes faults such as net touches or balls out and may help us classify
+errors. The original CSV and `raw_conf_data` retain every column.
+
+These are inputs for constructing rally-level metrics, not a ready-to-fit
+predictor table. `point_won_by` and `winning_attack` describe the completed
+rally: use them only after that rally ends. For predictions before a rally,
+use prior-rally metrics and the start-of-point scores. The eventual set winner
+is the outcome label, never a predictor.
+
+
+## Separating conference matches by ID
+
+Each entry in `conference_matches` is a data frame containing all rows for one
+match. The list is named by `match_id`, and row order within each match is preserved.
+There are 104 recorded matches within the conference where all games were home games
+
+```{r}
+stopifnot(!anyNA(raw_conf_data$match_id), all(nzchar(raw_conf_data$match_id)))
+conference_matches <- split(conference_data, conference_data$match_id)
+
+# A lookup table to identify matches and see how many recorded rows each has.
+match_summary <- conference_data |>
+  group_by(match_id, home_team, visiting_team) |>
+  summarise(recorded_rows = n(), .groups = "drop")
+
+match_summary
+length(conference_matches)
+```
+
+## Looking at an individual match
+
+Use a match ID from `match_summary` to select a match. These are recorded event
+rows, so `recorded_rows` is not a count of points or rallies.
+
+```{r}
+#Other ways to select or inspect a match:
+first_match <- conference_matches[[1]]
+head(first_match)
+# View(first_match)  # Open in an interactive R session.
+```
+
+
+## Looking at the just the first match
+
+We're looking for a relationship that would exist between the number of points and the teams chances of winning at that given point.
+
+Split the first match into a named list using `set_number`. Each entry contains
+all recorded rows for that set, in their original order. Here, "first match"
+means the first entry in `conference_matches`, which is ordered by match ID.
+
+```{r}
+stopifnot(!anyNA(first_match$set_number))
+first_match_sets <- split(first_match, first_match$set_number)
+
+# See which match and sets we are working with.
+unique(first_match[c("match_id", "home_team", "visiting_team")])
+set_summary <- first_match |>
+  count(set_number, name = "recorded_rows")
+set_summary
+
+# Isolate set 1 for our initial analysis.
+first_set <- first_match_sets[["1"]]
+head(first_set)
+
+# Select another set by its number when needed:
+# second_set <- first_match_sets[["2"]]
+# View(first_set)  # Open in an interactive R session.
+```
+
+## Who won each set, and when?
+
+Use the last point record (`point == TRUE`) in each set to read the final
+score. Some `end_of_set` markers are assigned to the next set, so we do not
+use those markers to determine the winner. Only label a winner when the
+recorded score reaches the set's target with a lead of at least two points.
+
+```{r}
+first_match_results <- first_match |>
+  mutate(match_event_row = row_number()) |>
+  filter(point %in% TRUE) |>
+  group_by(match_id, set_number) |>
+  slice_tail(n = 1) |>
+  ungroup() |>
+  mutate(
+    target_score = if_else(set_number == 5, 15L, 25L),
+    set_complete = !is.na(home_team_score) &
+      !is.na(visiting_team_score) &
+      pmax(home_team_score, visiting_team_score) >= target_score &
+      abs(home_team_score - visiting_team_score) >= 2,
+    winning_team = case_when(
+      set_complete & home_team_score > visiting_team_score ~ home_team,
+      set_complete & visiting_team_score > home_team_score ~ visiting_team,
+      TRUE ~ NA_character_
+    ),
+    total_points_at_end = home_team_score + visiting_team_score
+  ) |>
+  select(
+    match_id, set_number, home_team, visiting_team,
+    home_team_score, visiting_team_score, winning_team, set_complete,
+    total_points_at_end, point_id, match_event_row, file_line_number
+  )
+
+first_match_results
+
+# The result for the set we isolated earlier.
+first_set_result <- first_match_results |>
+  filter(set_number == 1)
+first_set_result
+```
+
+`total_points_at_end` tells us how many points had been scored when the set
+ended. `point_id` is the raw identifier, not the number of rallies in that set.
+`match_event_row` locates the final point record within `first_match`.
+The trimmed table tracks when a set ends by point count and event order.
+If `set_complete` is false, the last recorded score does not establish a winner.
+
+## Building live performance inputs and initial models
+
+The following script builds one snapshot after each completed rally across all
+conference matches. Each snapshot contains cumulative attempts, kills, attack
+errors, blocked attacks, aces, service errors, reception quality, recorded errors,
+earned scoring actions, sideout rates, and serving-point rates for both teams.
+Blocked attacks (`/`) are separate from attacks blocked for reattack (`!`).
+Recorded errors are not automatically classified as unforced errors. Earned
+scoring actions and errors are event counts, not mutually exclusive point causes.
+
+Raw percentages use a 0–100 scale and are undefined before any attempts.
+Attack efficiency uses a -1 to 1 scale. For modeling, rate inputs use fixed
+smoothing and home-minus-visiting differences on a proportion scale. All
+calculations reset at the start of each set and use only completed rallies.
+
+We retain `winning_attack` for comparison with the Attack/`#` definition. The
+`kill_flag_audit` table exposes disagreements for review.
+
+```{r}
+#source("R/live_set_models.R")
+
+# Check excluded sets and inconsistent kill flags before interpreting results.
+count(set_audit, usable)
+kill_flag_audit
+
+first_set_metrics <- rally_metrics |>
+  filter(match_id == first_match$match_id[1], set_number == 1)
+first_set_metrics |>
+  select(rally_number, home_team_score, visiting_team_score,
+         home_attack_attempts, home_kills, home_attack_errors,
+         home_blocked_attacks, home_kill_pct, home_attack_efficiency,
+         away_attack_attempts, away_kills, away_kill_pct) |>
+  head(10)
+```
+
+One set lets us verify metrics, but training requires multiple set outcomes.
+The script excludes sets with incomplete or inconsistent scoring sequences.
+It holds out 20% of matches, with every set and rally from a match kept together.
+Final set-winning rallies are excluded from model inputs. The eventual winner
+is used only as the response label. Each set receives equal total weight.
+
+The first model uses score difference, total points, their interaction, next
+serving team, and whether this is a fifth set. The second adds seven skill-rate
+differences. Sideout and serving-point metrics remain available for analysis;
+we do not add every related metric to the initial model at once.
+
+```{r}
+model_comparison
+stage_comparison
+calibration_table
+```
+
+Lower Brier score and log loss indicate better probability predictions.
+Compare score-plus-skills with score-only to see whether skill metrics add
+information beyond the score. This is an initial holdout comparison, not a
+validated coaching rule. Repeated rallies are correlated, so ordinary model
+coefficient p-values should not be interpreted as independent-observation
+evidence. Subsequent tuning should use grouped cross-validation within training
+matches and leave these test matches untouched. Early/middle/late labels here
+use total points and should be evaluated separately for shorter fifth sets.
+
+```{r}
+# Show prediction updates for a held-out set, rather than a training example.
+example_prediction <- test_predictions |>
+  filter(match_id == test_ids[1],
+         set_number == min(set_number[match_id == test_ids[1]]))
+
+# Use one score record per rally; include the actual final point, but do not
+# make a prediction after the outcome is known.
+example_score <- rally_metrics |>
+  filter(match_id == example_prediction$match_id[1],
+         set_number == example_prediction$set_number[1]) |>
+  select(rally_number, home_team_score, home_team, visiting_team, target)
+score_axis_max <- max(example_score$target, example_score$home_team_score)
+score_label <- paste0(example_score$home_team[1], " cumulative score")
+example_score <- bind_rows(
+  tibble(rally_number = 0L, home_team_score = 0L), example_score
+)
+
+prediction_plot <- ggplot(example_prediction,
+       aes(x = rally_number, y = win_probability, color = model)) +
+  geom_line() +
+  geom_step(data = example_score,
+            aes(x = rally_number, y = home_team_score / score_axis_max,
+                color = "home_score"),
+            inherit.aes = FALSE, linewidth = 0.7, linetype = "dashed") +
+  scale_color_manual(
+    values = c(score_only = "#F8766D", score_plus_skills = "#00BFC4",
+               home_score = "#333333"),
+    breaks = c("score_only", "score_plus_skills", "home_score"),
+    labels = c("Score only", "Score plus skills", score_label)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1), labels = scales::label_percent(),
+    sec.axis = sec_axis(~ . * score_axis_max,
+                        name = paste0(example_score$home_team[2], " points"))
+  ) +
+  labs(x = "Completed rallies", y = "Probability home team wins the set",
+       color = NULL, title = "Predictions and home score during a held-out set",
+       subtitle = paste(example_prediction$home_team[1], "vs",
+                        example_prediction$visiting_team[1], "— set",
+                        example_prediction$set_number[1]),
+       caption = "Probability: left axis. Dashed home score: right axis. Final point shown for score only.") +
+  theme_minimal()
+prediction_plot
+```
+
+The dashed staircase shows the home team's cumulative points on the right axis.
+It rises by one when home wins a rally and stays flat when visiting wins.
+The colored lines use the left probability axis. Their vertical intersections
+with the score line have no statistical meaning: the axes measure different things.
+
+### What the fitted models use
+
+Both fitted models use logistic regression to predict `home_set_win` (1 for
+a home win, 0 for a visiting win). Coefficients are estimated from the training
+matches, with equal total weight for each set. The `quasibinomial()` family
+uses a logistic probability function and accommodates the fractional weights.
+
+The inputs for the model are used to predict given the current metrics for the  |
+
+| `score_difference` | Home points minus visiting points |
+| `total_points` | Home points plus visiting points |
+| `score_difference:total_points` | Allows the effect of a lead to change as points accumulate |
+| `next_home_serves` | 1 if home will serve the next rally, otherwise 0 |
+| `fifth_set` | 1 for the shorter fifth set, otherwise 0 |
+
+The score-plus-skills model adds home-minus-visiting differences in kill rate,
+attack-error rate, blocked-attack rate, ace rate, service-error rate,
+perfect-reception rate, and reception-error rate. Each rate is cumulative
+within the set and smoothed as `(count + 0.5) / (attempts + 1)` for model input.
+Displayed raw percentages are unsmoothed. These two models do not yet use
+recent rally windows, player identities, PCA, or the other candidate algorithms.
+
+## Candidate models and dimension reduction
+
+These are replacement working snippets for the candidate models discussed in
+our notes; the original wording was not recoverable from the workspace or Git.
+They are deliberately not executed during rendering. The logistic models above
+are initial baselines, not a restriction on which models we will compare.
+
+All candidates should predict home-set win probabilities using the same inputs
+and match-grouped splits. Choose tuning parameters using grouped validation
+within training matches before evaluating the reserved test matches.
+
+### Common inputs
+
+Standardize continuous inputs using training means and standard deviations.
+Keep IDs and the eventual winner out of the predictor matrix. These snippets
+use the same score and skill inputs as the initial skill model.
+
+```{r}
+#| eval: false
+x_train <- model.matrix(skill_formula, train_data)[, -1, drop = FALSE]
+x_test <- model.matrix(skill_formula, test_data)[, -1, drop = FALSE]
+varying <- apply(x_train, 2, sd) > 0
+x_train <- x_train[, varying, drop = FALSE]
+x_test <- x_test[, varying, drop = FALSE]
+training_center <- colMeans(x_train)
+training_scale <- apply(x_train, 2, sd)
+x_train_scaled <- scale(x_train, center = training_center, scale = training_scale)
+x_test_scaled <- scale(x_test, center = training_center, scale = training_scale)
+y_train <- factor(train_data$home_set_win, levels = c(0, 1))
+```
+
+### Naive Bayes
+
+A simple probabilistic benchmark. Its conditional-independence assumption may
+be restrictive because our skill rates and score measures are related.
+
+```{r}
+#| eval: false
+nb_fit <- e1071::naiveBayes(x = x_train_scaled, y = y_train)
+nb_probability <- predict(nb_fit, x_test_scaled, type = "raw")[, "1"]
+```
+
+### K-nearest neighbors (KNN)
+
+Predict using similar rally snapshots. Scaling matters because distance drives
+the predictions. Tune the neighbor count within match-grouped training folds;
+the value below is only an example. Nearby snapshots from one set can dominate
+the neighbors, so consider balanced snapshot sampling per set during training.
+
+```{r}
+#| eval: false
+knn_fit <- class::knn(train = x_train_scaled, test = x_test_scaled,
+                      cl = y_train, k = 25, prob = TRUE)
+winning_class_probability <- attr(knn_fit, "prob")
+knn_probability <- ifelse(knn_fit == "1", winning_class_probability,
+                          1 - winning_class_probability)
+```
+
+### Quadratic discriminant analysis (QDA)
+
+Allows a different covariance matrix for each outcome class. Highly correlated
+or redundant predictors can cause singular covariance estimates. Reduce the
+predictor set or compare PCA inputs if this occurs; check assumptions rather
+than treating the large number of rally rows as independent evidence.
+
+```{r}
+#| eval: false
+qda_fit <- MASS::qda(x = x_train_scaled, grouping = y_train)
+qda_probability <- predict(qda_fit, x_test_scaled)$posterior[, "1"]
+```
+
+### Neural network
+
+A small network can learn nonlinear relationships. Tune hidden-unit count and
+weight decay within training folds. Begin small because the number of distinct
+matches and sets is much smaller than the number of rally snapshots.
+
+```{r}
+#| eval: false
+set.seed(4640)
+nn_fit <- nnet::nnet(x = x_train_scaled, y = train_data$home_set_win,
+                     size = 3, decay = 0.1, entropy = TRUE,
+                     weights = train_data$set_weight,
+                     maxit = 500, trace = FALSE)
+nn_probability <- as.numeric(predict(nn_fit, x_test_scaled, type = "raw"))
+```
+
+### PCA followed by logistic regression
+
+PCA combines correlated predictors into fewer components. It finds directions
+of predictor variation, not directions that necessarily predict wins. Compare
+its held-out performance with the original predictors; it also makes skill-level
+interpretation less direct. PCR conventionally uses those components in linear
+regression. For this binary response, use a logistic classifier on the components.
+
+Fit PCA on training data only. Repeat scaling, PCA fitting, and component-count
+selection separately inside every validation fold. The three components below
+are illustrative, not a tuned choice. This example transforms all inputs; we
+could alternatively transform only skill inputs and keep score terms explicit.
+
+```{r}
+#| eval: false
+pca_fit <- prcomp(x_train_scaled, center = FALSE, scale. = FALSE)
+cumulative_variance <- cumsum(pca_fit$sdev^2) / sum(pca_fit$sdev^2)
+n_components <- min(3L, ncol(pca_fit$x))
+pc_names <- paste0("PC", seq_len(n_components))
+pc_train <- as.data.frame(pca_fit$x[, pc_names, drop = FALSE])
+pc_test <- as.data.frame(predict(pca_fit, x_test_scaled)[, pc_names, drop = FALSE])
+pc_train$home_set_win <- train_data$home_set_win
+pc_train$set_weight <- train_data$set_weight
+pca_formula <- reformulate(pc_names, response = "home_set_win")
+pca_logistic_fit <- glm(pca_formula, data = pc_train,
+                         family = quasibinomial(), weights = set_weight)
+pca_probability <- predict(pca_logistic_fit, pc_test, type = "response")
+```
+
+For each candidate, compare set-weighted Brier score, log loss, calibration, and
+performance by set stage. Naive Bayes, KNN, and QDA examples above do not apply
+the baseline's set weights during fitting; report that distinction or use a
+shared balanced-snapshot training strategy for a fairer comparison. These are
+templates until dependencies, grouped tuning, and model diagnostics are checked.
