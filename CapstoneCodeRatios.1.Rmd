@@ -1,0 +1,290 @@
+---
+title: "CapstoneCodeRatios"
+output: html_document
+---
+
+```{r}
+
+
+library(tidyverse)
+library(knitr)
+library(tinytex)
+
+
+conference_matches <- read_csv("dirty_conference_matches.csv")
+
+
+
+
+```
+
+
+
+
+
+
+```{r}
+bySet_raw <- conference_matches %>%
+  select(
+    skill_type, evaluation_code, home_team_score, visiting_team_score,
+    skill, team, match_id, set_number
+  ) %>%
+  mutate(
+    set_id = paste(match_id, set_number, sep = "_")
+  ) %>%
+  group_by(set_id) %>%
+  mutate(
+    final_home_score = max(home_team_score, na.rm = TRUE),
+    final_visiting_score = max(visiting_team_score, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    set_won = case_when(
+      team == "CU" & final_home_score > final_visiting_score ~ TRUE,
+      team == "CU" & final_visiting_score > final_home_score ~ FALSE,
+      team != "CU" & final_home_score > final_visiting_score ~ FALSE,
+      team != "CU" & final_visiting_score > final_home_score ~ TRUE
+    ),
+    
+    result = case_when(
+      skill %in% c("Attack", "Serve", "Block") &
+        evaluation_code == "#" ~ "Point",
+      
+      skill %in% c("Attack", "Serve", "Set", "Free Ball") &
+        evaluation_code == "=" ~ "Unforced Error",
+      TRUE ~ evaluation_code,
+      TRUE ~ coalesce(evaluation_code, "0")
+    )
+  )
+```
+
+initial wrangling to group by set, attach wins or loses to every observation and clarify points and unforced errors.
+
+
+
+```{r}
+bySet_summary <- bySet_raw %>%
+  filter(!is.na(result)) %>%
+  group_by(
+    set_id, team,
+    final_home_score,
+    final_visiting_score,
+    set_won,
+    skill
+  ) %>%
+  summarise(
+    earnedPoints = sum(result == "Point"),
+    UnforcedErrors = sum(result == "Unforced Error"),
+    point_error_ratio = earnedPoints / UnforcedErrors,
+    .groups = "drop"
+  ) %>%
+  pivot_wider(    
+    names_from = skill,
+    values_from = c(
+      earnedPoints,
+      UnforcedErrors,
+      point_error_ratio
+    ),
+    names_glue = "{skill}_{.value}"
+  ) %>%
+  mutate(
+    across(
+      c(
+        Attack_earnedPoints, Attack_UnforcedErrors,
+        Block_earnedPoints, Block_UnforcedErrors,
+        Serve_earnedPoints, Serve_UnforcedErrors,
+        Set_earnedPoints, Set_UnforcedErrors
+      ),
+      ~ replace_na(.x, 0)
+    )
+  )
+
+
+
+
+  
+```
+
+Creates ratios of earned points to unforced errors for each skill in each set combining those stats into one observation.
+
+A problem with the ratios is that sometimes the team does not make any errors in that category so it shows inf. Replacing with NA does not seem appropriate because those are important cases that happen often.
+Could maybe create an indicator variable to check if there were any errors in that category 
+
+
+
+
+
+
+
+```{r}
+attack_summary <- bySet_raw %>%
+  filter(skill == "Attack") %>%
+  group_by(set_id, team, set_won) %>%
+  summarise(
+    total_attacks = n(),
+    attack_kills  = sum(evaluation_code == "#", na.rm = TRUE),
+    kill_rate     = attack_kills / total_attacks,
+    .groups = "drop"
+  )
+
+
+
+serve_summary <- bySet_raw %>%
+  filter(skill == "Serve") %>%
+  group_by(set_id, team, set_won) %>%
+  summarise(
+    total_serves = n(),
+    serve_points = sum(evaluation_code == "#", na.rm = TRUE),
+    ace_rate = serve_points / total_serves,
+    .groups = "drop"
+  )
+
+
+
+
+bySet_final <- bySet_summary %>%
+  left_join(
+    attack_summary,
+    by = c("set_id", "team", "set_won")
+  ) %>%
+  left_join(
+    serve_summary,
+    by = c("set_id", "team", "set_won")
+  )
+
+```
+
+Created kill rate and service ace rate.
+
+
+
+```{r}
+
+# kill/ace rates + errors 
+logistic_model <- glm(set_won ~ kill_rate + ace_rate + Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors,
+                      data = bySet_final,
+                      family = binomial)
+
+
+summary(logistic_model)
+
+```
+
+
+
+
+```{r}
+
+# all earned points + errors 
+logistic_model2 <- glm(set_won ~  Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors + Attack_earnedPoints + Serve_earnedPoints,
+                     data = bySet_final,
+                     family = binomial)
+summary(logistic_model2)
+
+
+
+```
+
+```{r}
+# everything
+logistic_model3 <- glm(set_won ~  Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors + Attack_earnedPoints + Serve_earnedPoints + kill_rate + ace_rate,
+                     data = bySet_final,
+                     family = binomial)
+
+summary(logistic_model3)
+```
+
+
+```{r}
+
+# rf everything
+library(randomForest)
+
+rf_model <- randomForest(
+  set_won ~Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors + Attack_earnedPoints + Serve_earnedPoints + kill_rate + ace_rate,
+  data = bySet_final,
+  ntree = 500,
+  importance = TRUE
+)
+
+importance(rf_model)
+
+
+```
+
+
+
+```{r}
+
+# interaction models
+attack_model <- lm(Attack_earnedPoints ~ Attack_UnforcedErrors * set_won + total_attacks, data = bySet_final)
+
+summary(attack_model)
+
+
+serve_model <- lm(Serve_earnedPoints ~ Serve_UnforcedErrors * set_won + total_serves, data = bySet_final)
+summary(serve_model)
+```
+
+
+
+
+```{r}
+
+killRateModel <- lm(kill_rate ~ Attack_UnforcedErrors + Attack_earnedPoints, data = bySet_final)
+summary(killRateModel)
+
+```
+
+Both errors and points equally influence the kill rate estimate but the amount of points for each set greatly outweighs the amount of errors for each set and since the rate doesn't drop as much with each error it implies the penalty for missing is less than the reward in kill rate for playing more risky.
+
+
+
+
+
+In game probability calc
+
+```{r}
+bySet_progress <- bySet_raw %>%
+  group_by(set_id, team) %>%
+  mutate(
+    Attack_earnedPoints = cumsum(
+      ifelse(skill == "Attack" & result == "Point", 1, 0)
+    ),
+    
+    Attack_UnforcedErrors = cumsum(
+      ifelse(skill == "Attack" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Serve_earnedPoints = cumsum(
+      ifelse(skill == "Serve" & result == "Point", 1, 0)
+    ),
+    
+    Serve_UnforcedErrors = cumsum(
+      ifelse(skill == "Serve" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Block_earnedPoints = cumsum(
+      ifelse(skill == "Block" & result == "Point", 1, 0)
+    ),
+    
+    Set_UnforcedErrors = cumsum(
+      ifelse(skill == "Set" & result == "Unforced Error", 1, 0)
+    ),
+    
+    FreeBall_UnforcedErrors = cumsum(
+      ifelse(skill == "Free Ball" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Total_EarnedPoints = cumsum(
+      ifelse(result == "Point", 1, 0)
+    ),
+    
+    Total_UnforcedErrors = cumsum(
+      ifelse(result == "Unforced Error", 1, 0)
+    )
+  ) %>%
+  ungroup()
+
+
+```
