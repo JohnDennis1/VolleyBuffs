@@ -1,0 +1,31 @@
+---
+title: "Data_Wrangling"
+format: html
+---
+
+An explanation of the methods and assumptions being made for our data wrangling
+
+Given our large data set containing 87 variables is to select information we consider useful.
+Our eventual goal is to use set data to train and test various predictive models. This requires us to have set summaries the model can easily use to train and then eventually test.
+
+To begin we need to isolate the matches which is done by the match ids. Then within each match we need to look at set level data which is organized via the `match_id` and the `set_number`. Then we need to see which team wins and their related performance within the match which will use `team` on top of the other identifying characteristics.
+
+We begin with our function to bring in all the raw conference data.
+
+
+```{r}
+wrangle_set_skills <- function(raw_data) {
+}
+```
+
+We've identified which predictors are useful and we list them under `required` so that we can continue to work with them later under this subset name.
+
+
+```{r}
+required <- c(
+  "match_id", "set_number", "file_line_number", "point_id",
+  "home_team", "visiting_team", "team", "skill",
+  "evaluation_code", "point", "point_won_by",
+  "home_team_score", "visiting_team_score"
+)
+```
