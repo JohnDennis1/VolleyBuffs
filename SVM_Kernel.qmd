@@ -1,0 +1,115 @@
+---
+title: "SVM_Kernel"
+format: pdf
+---
+
+## Load the data
+
+```{r}
+#Ensure that Data_Wrangling_LivePred.R is in your working directory
+library(e1071)
+```
+
+```{r}
+# Run the wrangling script. It creates the objects below in this R session.
+# It also saves copies under Data/derived; it does not split or fit models.
+source("R/Data_Wrangling_LivePred.R")
+```
+
+The script creates two data frames containing the same rally observations:
+`score_only` and `score_plus_skills`. These include identifiers and the outcome,
+so we should not pass every column directly to a model.
+
+It also creates numeric predictor matrices: `x_score` and `x_skills`.
+The separate factor `y` contains the home team's eventual `loss` or `win`.
+The starting skill matrix uses cumulative counts; rates remain available in
+the larger data frame for later selection and preprocessing.
+
+```{r,echo=FALSE,message=FALSE}
+
+# Dimensions are number of rally snapshots by number of predictor columns.
+dim(x_score)
+dim(x_skills)
+```
+
+## Prepare for the training/test split
+
+```{r,echo=FALSE,message=FALSE}
+
+# Choose scores plus skills for this SVM; use x_score for the score-only model.
+svm_x <- x_skills
+svm_y <- y
+
+# Keep match IDs alongside the inputs so entire matches stay in one partition.
+# Do not include these IDs as SVM predictors.
+match_ids <- score_plus_skills$match_id
+```
+
+
+```{r}
+# Make the random selection reproducible.
+set.seed(303)
+
+# List each match once, in a consistent order.
+matches <- sort(unique(score_only$match_id))
+
+# Randomly reserve approximately 20% of matches for testing.
+test_matches <- sample(
+  matches,
+  size = ceiling(0.20 * length(matches))
+)
+
+# Identify the rows belonging to those matches.
+# Both predictor matrices have exactly the same row order.
+is_test <- score_only$match_id %in% test_matches
+
+# Score-only inputs.
+x_score_train <- x_score[!is_test, , drop = FALSE]
+x_score_test  <- x_score[is_test, , drop = FALSE]
+
+# Score-plus-skills inputs: use the SAME row selection.
+x_skills_train <- x_skills[!is_test, , drop = FALSE]
+x_skills_test  <- x_skills[is_test, , drop = FALSE]
+
+# Both models use the same outcome labels.
+y_train <- y[!is_test]
+y_test  <- y[is_test]
+```
+
+```{r}
+# This will fit the score-only model
+svm_score <- svm(
+  x = x_score_train,        # this uses the training predictors
+  y = y_train,              # the y training has the known win/loss outcom
+  type = "C-classification",
+  kernel = "radial",         # RBF is a good standard
+  cost = 5,                  # will tune this later
+  scale = TRUE              # Learn scaling from training inputs
+)
+
+# Fitting the score-plus-skills model with same training as the previous but with skills
+svm_skills <- svm(
+  x = x_skills_train,
+  y = y_train,              # Making sure to use the same outcomes and training observations as to not compare different things
+  type = "C-classification",
+  kernel = "radial",
+  cost = 5,
+  scale = TRUE
+)
+
+# this will see how the models predicted
+pred_score <- predict(svm_score, newdata = x_score_test) 
+pred_skills <- predict(svm_skills, newdata = x_skills_test)
+
+# Confusing mat or something
+table(Actual = y_test, Predicted = pred_score)
+table(Actual = y_test, Predicted = pred_skills)
+
+# Fraction of the test set snapshot accurately identified
+mean(pred_score == y_test)
+mean(pred_skills == y_test) # the skills one did perform worse than the score only #For kernel = RBF, and 
+```
+
+
+
+
