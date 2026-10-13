@@ -1,0 +1,98 @@
+---
+title: "Random Forest: Live Set-Win Probability"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  warning: false
+  message: false
+---
+
+## Setup
+
+`evaluation_functions.R` loads the wrangled snapshots with the shared season
+split attached, and provides the cross-validation and scoring tools every model
+uses. Run `Data_Wrangling_LivePred.R` first if `Data/derived/live_analysis.rds`
+does not exist.
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(ranger)
+
+source("evaluation_functions.R")
+live <- load_model_data()
+options(width = 120)  # print wide tables without truncating columns
+```
+
+What we are working with: one row per completed rally, with the season split
+attached in `live$meta`.
+
+```{r}
+#| label: data-overview
+dim(live$x_score)   # 4 score predictors
+dim(live$x_skills)  # 4 score predictors + 38 cumulative skill counts
+table(role = live$meta$role, fold = live$meta$fold, useNA = "ifany")
+```
+
+## Step 1: Baseline forest
+
+A probability forest with default settings, fitted on two feature sets:
+
+- `score`: the same four inputs as the score-only logistic baseline.
+- `score_skills`: the score inputs plus the 38 cumulative skill counts.
+
+Comparing the two tells us whether the forest can extract information from the
+skill counts that the logistic model could not.
+
+`case.weights` makes each set count equally, as in the baselines. We do not
+use the forest's out-of-bag error: rallies from the same set are nearly
+identical, so out-of-bag rows are not truly unseen.
+
+```{r}
+#| label: rf-functions
+rf_fit <- function(x, y, w) {
+  ranger(x = x, y = y, case.weights = w, probability = TRUE,
+         num.trees = 500, seed = 4640)
+}
+rf_predict <- function(model, x) {
+  predict(model, x)$predictions[, "win"]
+}
+```
+
+Season cross-validation: each training season is predicted by a forest fitted
+on the other three. The test seasons are not touched.
+
+```{r}
+#| label: rf-default-cv
+rf_cv <- bind_rows(
+  cv_predictions(live, live$x_score, rf_fit, rf_predict) |>
+    mutate(model = "rf_default", feature_set = "score"),
+  cv_predictions(live, live$x_skills, rf_fit, rf_predict) |>
+    mutate(model = "rf_default", feature_set = "score_skills")
+)
+```
+
+Compare with the baselines on the same cross-validation snapshots. Lower is
+better; `diff_vs_ref` is the Brier difference from the score-only logistic
+model (negative = better).
+
+```{r}
+#| label: rf-default-scores
+baseline_cv <- read_predictions() |> filter(split == "cv")
+step1 <- score_predictions(bind_rows(baseline_cv, rf_cv), live$meta)
+
+step1$summary |>
+  select(model, feature_set, brier, log_loss, diff_vs_ref, diff_low, diff_high)
+```
+
+Where in the set does each model do well or poorly?
+
+```{r}
+#| label: rf-default-stages
+step1$by_stage |>
+  mutate(model = paste(model, feature_set, sep = "__")) |>
+  select(model, stage, brier) |>
+  pivot_wider(names_from = stage, values_from = brier)
+```
