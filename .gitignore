@@ -5,3 +5,4 @@ Data/
 *_files/
 *.html
 .DS_Store
+predictions/comparison_*.csv
