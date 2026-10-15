@@ -1,0 +1,742 @@
+---
+title: "CapstoneCodeRatios"
+output: html_document
+---
+
+```{r}
+
+
+library(tidyverse)
+library(knitr)
+library(tinytex)
+
+
+conference_matches <- read_csv("dirty_conference_matches.csv")
+
+
+bruh <- read_csv("conference_matches_raw.csv")
+
+
+
+
+```
+
+
+
+
+
+
+```{r}
+bySet_raw <- conference_matches %>%
+  select(
+    skill_type, evaluation_code, home_team_score, visiting_team_score,
+    skill, team, match_id, set_number
+  ) %>%
+  mutate(
+    set_id = paste(match_id, set_number, sep = "_")
+  ) %>%
+  group_by(set_id) %>%
+  mutate(
+    final_home_score = max(home_team_score, na.rm = TRUE),
+    final_visiting_score = max(visiting_team_score, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    set_won = case_when(
+      team == "CU" & final_home_score > final_visiting_score ~ TRUE,
+      team == "CU" & final_visiting_score > final_home_score ~ FALSE,
+      team != "CU" & final_home_score > final_visiting_score ~ FALSE,
+      team != "CU" & final_visiting_score > final_home_score ~ TRUE
+    ),
+    
+    result = case_when(
+      skill %in% c("Attack", "Serve", "Block") &
+        evaluation_code == "#" ~ "Point",
+      
+      skill %in% c("Attack", "Serve", "Set", "Free Ball") &
+        evaluation_code == "=" ~ "Unforced Error",
+      TRUE ~ evaluation_code,
+      TRUE ~ coalesce(evaluation_code, "0")
+    )
+  )
+```
+
+initial wrangling to group by set, attach wins or loses to every observation and clarify points and unforced errors.
+
+
+
+```{r}
+bySet_summary <- bySet_raw %>%
+  filter(!is.na(result)) %>%
+  group_by(
+    set_id, team,
+    final_home_score,
+    final_visiting_score,
+    set_won,
+    skill
+  ) %>%
+  summarise(
+    earnedPoints = sum(result == "Point"),
+    UnforcedErrors = sum(result == "Unforced Error"),
+    point_error_ratio = earnedPoints / UnforcedErrors,
+    .groups = "drop"
+  ) %>%
+  pivot_wider(    
+    names_from = skill,
+    values_from = c(
+      earnedPoints,
+      UnforcedErrors,
+      point_error_ratio
+    ),
+    names_glue = "{skill}_{.value}"
+  ) %>%
+  mutate(
+    across(
+      c(
+        Attack_earnedPoints, Attack_UnforcedErrors,
+        Block_earnedPoints, Block_UnforcedErrors,
+        Serve_earnedPoints, Serve_UnforcedErrors,
+        Set_earnedPoints, Set_UnforcedErrors
+      ),
+      ~ replace_na(.x, 0)
+    )
+  )
+
+
+
+
+  
+```
+
+Creates ratios of earned points to unforced errors for each skill in each set combining those stats into one observation.
+
+A problem with the ratios is that sometimes the team does not make any errors in that category so it shows inf. Replacing with NA does not seem appropriate because those are important cases that happen often.
+Could maybe create an indicator variable to check if there were any errors in that category 
+
+
+
+
+
+
+
+```{r}
+attack_summary <- bySet_raw %>%
+  filter(skill == "Attack") %>%
+  group_by(set_id, team, set_won) %>%
+  summarise(
+    total_attacks = n(),
+    attack_kills  = sum(evaluation_code == "#", na.rm = TRUE),
+    kill_rate     = attack_kills / total_attacks,
+    .groups = "drop"
+  )
+
+
+
+serve_summary <- bySet_raw %>%
+  filter(skill == "Serve") %>%
+  group_by(set_id, team, set_won) %>%
+  summarise(
+    total_serves = n(),
+    serve_points = sum(evaluation_code == "#", na.rm = TRUE),
+    ace_rate = serve_points / total_serves,
+    .groups = "drop"
+  )
+
+
+
+
+bySet_final <- bySet_summary %>%
+  left_join(
+    attack_summary,
+    by = c("set_id", "team", "set_won")
+  ) %>%
+  left_join(
+    serve_summary,
+    by = c("set_id", "team", "set_won")
+  )
+
+```
+
+Created kill rate and service ace rate.
+
+
+
+```{r}
+
+# kill/ace rates + errors 
+logistic_model <- glm(set_won ~ kill_rate + ace_rate + Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors,
+                      data = bySet_final,
+                      family = binomial)
+
+
+summary(logistic_model)
+
+```
+
+
+
+
+```{r}
+
+# all earned points + errors 
+logistic_model2 <- glm(set_won ~  Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors + Attack_earnedPoints + Serve_earnedPoints,
+                     data = bySet_final,
+                     family = binomial)
+summary(logistic_model2)
+
+
+
+```
+
+```{r}
+# everything
+logistic_model3 <- glm(set_won ~  Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors + Attack_earnedPoints + Serve_earnedPoints + kill_rate + ace_rate,
+                     data = bySet_final,
+                     family = binomial)
+
+summary(logistic_model3)
+```
+
+
+```{r}
+
+# rf everything
+library(randomForest)
+
+rf_model <- randomForest(
+  set_won ~Attack_UnforcedErrors + Serve_UnforcedErrors + Block_earnedPoints + Set_UnforcedErrors + Attack_earnedPoints + Serve_earnedPoints + kill_rate + ace_rate,
+  data = bySet_final,
+  ntree = 500,
+  importance = TRUE
+)
+
+importance(rf_model)
+
+
+```
+
+
+
+```{r}
+
+# interaction models
+attack_model <- lm(Attack_earnedPoints ~ Attack_UnforcedErrors * set_won + total_attacks, data = bySet_final)
+
+summary(attack_model)
+
+
+serve_model <- lm(Serve_earnedPoints ~ Serve_UnforcedErrors * set_won + total_serves, data = bySet_final)
+summary(serve_model)
+```
+
+
+
+
+```{r}
+
+killRateModel <- lm(kill_rate ~ Attack_UnforcedErrors + Attack_earnedPoints, data = bySet_final)
+summary(killRateModel)
+
+```
+
+Both errors and points equally influence the kill rate estimate but the amount of points for each set greatly outweighs the amount of errors for each set and since the rate doesn't drop as much with each error it implies the penalty for missing is less than the reward in kill rate for playing more risky.
+
+
+
+
+
+In game probability calc
+
+```{r}
+bySet_progress <- bySet_raw %>%
+  group_by(set_id, team) %>%
+  mutate(
+    Attack_earnedPoints = cumsum(
+      ifelse(skill == "Attack" & result == "Point", 1, 0)
+    ),
+    
+    Attack_UnforcedErrors = cumsum(
+      ifelse(skill == "Attack" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Serve_earnedPoints = cumsum(
+      ifelse(skill == "Serve" & result == "Point", 1, 0)
+    ),
+    
+    Serve_UnforcedErrors = cumsum(
+      ifelse(skill == "Serve" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Block_earnedPoints = cumsum(
+      ifelse(skill == "Block" & result == "Point", 1, 0)
+    ),
+    
+    Set_UnforcedErrors = cumsum(
+      ifelse(skill == "Set" & result == "Unforced Error", 1, 0)
+    ),
+    
+    FreeBall_UnforcedErrors = cumsum(
+      ifelse(skill == "Free Ball" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Total_EarnedPoints = cumsum(
+      ifelse(result == "Point", 1, 0)
+    ),
+    
+    Total_UnforcedErrors = cumsum(
+      ifelse(result == "Unforced Error", 1, 0)
+    )
+  ) %>%
+  ungroup()
+
+
+```
+
+
+
+```{r}
+bySet_progress <- bySet_raw %>%
+  group_by(set_id, team) %>%
+  mutate(
+    Attack_earnedPoints     = cumsum(skill %in% "Attack"    & result %in% "Point"),
+    Attack_UnforcedErrors   = cumsum(skill %in% "Attack"    & result %in% "Unforced Error"),
+    Serve_earnedPoints      = cumsum(skill %in% "Serve"     & result %in% "Point"),
+    Serve_UnforcedErrors    = cumsum(skill %in% "Serve"     & result %in% "Unforced Error"),
+    Block_earnedPoints      = cumsum(skill %in% "Block"     & result %in% "Point"),
+    Set_UnforcedErrors      = cumsum(skill %in% "Set"       & result %in% "Unforced Error"),
+    FreeBall_UnforcedErrors = cumsum(skill %in% "Free Ball" & result %in% "Unforced Error"),
+    Total_EarnedPoints      = cumsum(result %in% "Point"),
+    Total_UnforcedErrors    = cumsum(result %in% "Unforced Error")
+  ) %>%
+  ungroup()
+
+
+bySet_progress <- bySet_progress %>%
+  mutate(
+    score_diff = home_team_score - visiting_team_score,
+    points_played = home_team_score + visiting_team_score
+  )
+
+```
+
+
+
+
+
+knn 
+
+
+
+```{r}
+library(tidyverse)
+library(class)
+library(caret)
+
+knn_data <- bySet_progress %>%
+  filter(team == "CU") %>%
+  mutate(
+    score_diff = home_team_score - visiting_team_score
+  ) %>%
+  select(
+    set_id,
+    set_won,
+    score_diff,
+    Attack_earnedPoints,
+    Attack_UnforcedErrors,
+    Serve_earnedPoints,
+    Serve_UnforcedErrors,
+    Block_earnedPoints,
+    Total_EarnedPoints,
+    Total_UnforcedErrors,
+    home_team_score,
+    visiting_team_score,
+    score_diff,
+    points_played
+  ) %>%
+  drop_na()
+
+```
+
+
+```{r}
+set.seed(123)
+
+sets <- unique(knn_data$set_id)
+
+train_sets <- sample(
+  sets,
+  size = floor(0.8 * length(sets))
+)
+
+train_data <- knn_data %>%
+  filter(set_id %in% train_sets)
+
+test_data <- knn_data %>%
+  filter(!set_id %in% train_sets)
+
+
+```
+
+
+
+```{r}
+train_unique <- train_data %>%
+  distinct(
+    score_diff,
+    Total_EarnedPoints,
+    Total_UnforcedErrors,
+    set_won,
+    .keep_all = TRUE
+  )
+
+
+predictors <- c(
+  "score_diff",
+  "Total_EarnedPoints",
+  "Total_UnforcedErrors",
+  "Attack_earnedPoints",
+  "Serve_earnedPoints",
+  "Attack_UnforcedErrors"
+  
+)
+
+preprocess <- preProcess(
+  train_unique[, predictors],
+  method = c("center", "scale")
+)
+
+train_x <- predict(preprocess, train_unique[, predictors])
+test_x <- predict(preprocess, test_data[, predictors])
+
+
+
+knn_pred <- knn(
+  train = train_x,
+  test = test_x,
+  cl = factor(train_unique$set_won),
+  k = 15,
+  prob = TRUE,
+  use.all = FALSE
+)
+
+
+
+```
+
+
+
+testing: 
+
+```{r}
+test_results <- test_data %>%
+  mutate(
+    predicted_class = knn_pred,
+    neighbor_probability = attr(knn_pred, "prob"),
+    win_probability = ifelse(
+      predicted_class == "TRUE",
+      neighbor_probability,
+      1 - neighbor_probability
+    )
+  )
+
+# Confusion matrix
+confusionMatrix(
+  factor(test_results$predicted_class,
+         levels = c("FALSE", "TRUE")),
+  factor(test_results$set_won,
+         levels = c(FALSE, TRUE))
+)
+
+
+
+```
+
+
+
+
+```{r}
+predictors2 <- c(
+  "score_diff",
+  "Total_EarnedPoints",
+  "Total_UnforcedErrors",
+  "Attack_earnedPoints",
+  "Serve_earnedPoints",
+  "Attack_UnforcedErrors",
+  "home_team_score",
+  "visiting_team_score",
+  "points_played"
+  
+  
+)
+
+preprocess <- preProcess(
+  train_unique[, predictors2],
+  method = c("center", "scale")
+)
+
+train_x <- predict(preprocess, train_unique[, predictors2])
+test_x <- predict(preprocess, test_data[, predictors2])
+
+
+
+knn_pred2 <- knn(
+  train = train_x,
+  test = test_x,
+  cl = factor(train_unique$set_won),
+  k = 70,
+  prob = TRUE,
+  use.all = FALSE
+)
+
+
+
+# testing: 
+
+
+test_results <- test_data %>%
+  mutate(
+    predicted_class = knn_pred2,
+    neighbor_probability = attr(knn_pred, "prob"),
+    win_probability = ifelse(
+      predicted_class == "TRUE",
+      neighbor_probability,
+      1 - neighbor_probability
+    )
+  )
+
+# Confusion matrix
+confusionMatrix(
+  factor(test_results$predicted_class,
+         levels = c("FALSE", "TRUE")),
+  factor(test_results$set_won,
+         levels = c(FALSE, TRUE))
+)
+
+
+
+```
+
+The thing about KNN, at least how we used it in sports analytics is that it only considers the margin and the amount of time left 
+
+
+```{r}
+predictors3 <- c(
+  "score_diff",
+  "points_played",
+  "Total_EarnedPoints",
+  "Total_UnforcedErrors"
+)
+
+
+preprocess <- preProcess(
+  train_unique[, predictors3],
+  method = c("center", "scale")
+)
+
+train_x <- predict(preprocess, train_unique[, predictors3])
+test_x <- predict(preprocess, test_data[, predictors3])
+
+
+
+knn_pred3 <- knn(
+  train = train_x,
+  test = test_x,
+  cl = factor(train_unique$set_won),
+  k = 15,
+  prob = TRUE,
+  use.all = FALSE
+)
+
+
+test_results <- test_data %>%
+  mutate(
+    predicted_class = knn_pred3,
+    neighbor_probability = attr(knn_pred, "prob"),
+    win_probability = ifelse(
+      predicted_class == "TRUE",
+      neighbor_probability,
+      1 - neighbor_probability
+    )
+  )
+
+# Confusion matrix
+confusionMatrix(
+  factor(test_results$predicted_class,
+         levels = c("FALSE", "TRUE")),
+  factor(test_results$set_won,
+         levels = c(FALSE, TRUE))
+)
+
+
+
+
+```
+
+
+k tuning: 
+
+
+```{r}
+library(tidyverse)
+library(class)
+library(caret)
+
+predictors2 <- c(
+  "score_diff",
+  "Total_EarnedPoints",
+  "Total_UnforcedErrors",
+  "Attack_earnedPoints",
+  "Serve_earnedPoints",
+  "Attack_UnforcedErrors",
+  "home_team_score",
+  "visiting_team_score",
+  "points_played"
+)
+
+# Create 5 folds, keeping every observation from a set together
+set.seed(123)
+
+train_sets <- unique(train_data$set_id)
+set_folds <- sample(rep(1:5, length.out = length(train_sets)))
+
+fold_assignment <- tibble(
+  set_id = train_sets,
+  fold = set_folds
+)
+
+# Test odd values of k from 1 to 31
+k_values <- seq(50, 150, by = 20)
+
+cv_results <- list()
+
+for (fold_num in 1:5) {
+
+  fold_train <- train_data %>%
+    inner_join(
+      filter(fold_assignment, fold != fold_num),
+      by = "set_id"
+    )
+
+  fold_test <- train_data %>%
+    inner_join(
+      filter(fold_assignment, fold == fold_num),
+      by = "set_id"
+    )
+
+  # Remove duplicate training observations
+  fold_train_unique <- fold_train %>%
+    distinct(
+      across(all_of(c(predictors2, "set_won"))),
+      .keep_all = TRUE
+    )
+
+  # Scale using training data only
+  preprocessing <- preProcess(
+    fold_train_unique[, predictors2],
+    method = c("center", "scale")
+  )
+
+  train_x <- predict(
+    preprocessing,
+    fold_train_unique[, predictors2]
+  )
+
+  test_x <- predict(
+    preprocessing,
+    fold_test[, predictors2]
+  )
+
+  for (k in k_values) {
+
+    if (k >= nrow(fold_train_unique)) next
+
+    prediction <- knn(
+      train = train_x,
+      test = test_x,
+      cl = factor(
+        fold_train_unique$set_won,
+        levels = c(FALSE, TRUE)
+      ),
+      k = k,
+      use.all = FALSE
+    )
+
+    actual <- factor(
+      fold_test$set_won,
+      levels = c(FALSE, TRUE)
+    )
+
+    cm <- confusionMatrix(
+      factor(prediction, levels = c("FALSE", "TRUE")),
+      actual,
+      positive = "TRUE"
+    )
+
+    cv_results[[length(cv_results) + 1]] <- tibble(
+      fold = fold_num,
+      k = k,
+      accuracy = as.numeric(cm$overall["Accuracy"]),
+      balanced_accuracy =
+        as.numeric(cm$byClass["Balanced Accuracy"])
+    )
+  }
+}
+
+# Average performance across the five folds
+cv_summary <- bind_rows(cv_results) %>%
+  group_by(k) %>%
+  summarise(
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    mean_balanced_accuracy =
+      mean(balanced_accuracy, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_balanced_accuracy))
+
+cv_summary
+```
+
+
+```{r}
+
+best_k <- cv_summary %>%
+  slice_max(
+    mean_balanced_accuracy,
+    n = 1,
+    with_ties = FALSE
+  )
+
+best_k
+
+# Plot performance across k
+ggplot(cv_summary, aes(x = k)) +
+  geom_line(aes(y = mean_accuracy, color = "Accuracy")) +
+  geom_point(aes(y = mean_accuracy, color = "Accuracy")) +
+  geom_line(
+    aes(y = mean_balanced_accuracy, color = "Balanced Accuracy")
+  ) +
+  geom_point(
+    aes(y = mean_balanced_accuracy, color = "Balanced Accuracy")
+  ) +
+  labs(
+    title = "KNN Cross-Validation Performance",
+    x = "Number of Neighbors (k)",
+    y = "Mean Cross-Validation Score",
+    color = "Metric"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+
+ok so best k was 31 so 
+
+
+```{r}
+nrow(train_unique)
+length(unique(train_unique$set_id))
+
+
+```
