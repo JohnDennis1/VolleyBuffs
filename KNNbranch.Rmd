@@ -1,0 +1,239 @@
+---
+title: "KNNbranch"
+output: html_document
+---
+ 
+Model itself: k = 70, did CV to test values from 0-200 by 2
+Accuracy is .7161
+ 
+```{r}
+predictors2 <- c(
+  "score_diff",
+  "Total_EarnedPoints",
+  "Total_UnforcedErrors",
+  "Attack_earnedPoints",
+  "Serve_earnedPoints",
+  "Attack_UnforcedErrors",
+  "home_team_score",
+  "visiting_team_score",
+  "points_played"
+  
+  
+)
+
+preprocess <- preProcess(
+  train_unique[, predictors2],
+  method = c("center", "scale")
+)
+
+train_x <- predict(preprocess, train_unique[, predictors2])
+test_x <- predict(preprocess, test_data[, predictors2])
+
+
+
+knn_pred2 <- knn(
+  train = train_x,
+  test = test_x,
+  cl = factor(train_unique$set_won),
+  k = 70,
+  prob = TRUE,
+  use.all = FALSE
+)
+
+
+
+# testing: 
+
+
+test_results <- test_data %>%
+  mutate(
+    predicted_class = knn_pred2,
+    neighbor_probability = attr(knn_pred, "prob"),
+    win_probability = ifelse(
+      predicted_class == "TRUE",
+      neighbor_probability,
+      1 - neighbor_probability
+    )
+  )
+
+# Confusion matrix
+confusionMatrix(
+  factor(test_results$predicted_class,
+         levels = c("FALSE", "TRUE")),
+  factor(test_results$set_won,
+         levels = c(FALSE, TRUE))
+)
+
+
+
+```
+
+
+
+how I wrangled the data to get specific predictors like attack earned points
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(tinytex)
+
+conference_matches <- read_csv("dirty_conference_matches.csv")
+
+```
+
+```{r}
+bySet_raw <- conference_matches %>%
+  select(
+    skill_type, evaluation_code, home_team_score, visiting_team_score,
+    skill, team, match_id, set_number
+  ) %>%
+  mutate(
+    set_id = paste(match_id, set_number, sep = "_")
+  ) %>%
+  group_by(set_id) %>%
+  mutate(
+    final_home_score = max(home_team_score, na.rm = TRUE),
+    final_visiting_score = max(visiting_team_score, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    set_won = case_when(
+      team == "CU" & final_home_score > final_visiting_score ~ TRUE,
+      team == "CU" & final_visiting_score > final_home_score ~ FALSE,
+      team != "CU" & final_home_score > final_visiting_score ~ FALSE,
+      team != "CU" & final_visiting_score > final_home_score ~ TRUE
+    ),
+    
+    result = case_when(
+      skill %in% c("Attack", "Serve", "Block") &
+        evaluation_code == "#" ~ "Point",
+      
+      skill %in% c("Attack", "Serve", "Set", "Free Ball") &
+        evaluation_code == "=" ~ "Unforced Error",
+      TRUE ~ evaluation_code,
+      TRUE ~ coalesce(evaluation_code, "0")
+    )
+  )
+```
+initial wrangling to group by set, attach wins or loses to every observation and clarify points and unforced errors.
+
+
+```{r}
+bySet_summary <- bySet_raw %>%
+  filter(!is.na(result)) %>%
+  group_by(
+    set_id, team,
+    final_home_score,
+    final_visiting_score,
+    set_won,
+    skill
+  ) %>%
+  summarise(
+    earnedPoints = sum(result == "Point"),
+    UnforcedErrors = sum(result == "Unforced Error"),
+    point_error_ratio = earnedPoints / UnforcedErrors,
+    .groups = "drop"
+  ) %>%
+  pivot_wider(    
+    names_from = skill,
+    values_from = c(
+      earnedPoints,
+      UnforcedErrors,
+      point_error_ratio
+    ),
+    names_glue = "{skill}_{.value}"
+  ) %>%
+  mutate(
+    across(
+      c(
+        Attack_earnedPoints, Attack_UnforcedErrors,
+        Block_earnedPoints, Block_UnforcedErrors,
+        Serve_earnedPoints, Serve_UnforcedErrors,
+        Set_earnedPoints, Set_UnforcedErrors
+      ),
+      ~ replace_na(.x, 0)
+    )
+  )
+
+
+
+
+  
+```
+
+Creates ratios of earned points to unforced errors for each skill in each set combining those stats into one observation.
+
+A problem with the ratios is that sometimes the team does not make any errors in that category so it shows inf. Replacing with NA does not seem appropriate because those are important cases that happen often.
+Could maybe create an indicator variable to check if there were any errors in that category 
+
+```{r}
+bySet_progress <- bySet_raw %>%
+  group_by(set_id, team) %>%
+  mutate(
+    Attack_earnedPoints = cumsum(
+      ifelse(skill == "Attack" & result == "Point", 1, 0)
+    ),
+    
+    Attack_UnforcedErrors = cumsum(
+      ifelse(skill == "Attack" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Serve_earnedPoints = cumsum(
+      ifelse(skill == "Serve" & result == "Point", 1, 0)
+    ),
+    
+    Serve_UnforcedErrors = cumsum(
+      ifelse(skill == "Serve" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Block_earnedPoints = cumsum(
+      ifelse(skill == "Block" & result == "Point", 1, 0)
+    ),
+    
+    Set_UnforcedErrors = cumsum(
+      ifelse(skill == "Set" & result == "Unforced Error", 1, 0)
+    ),
+    
+    FreeBall_UnforcedErrors = cumsum(
+      ifelse(skill == "Free Ball" & result == "Unforced Error", 1, 0)
+    ),
+    
+    Total_EarnedPoints = cumsum(
+      ifelse(result == "Point", 1, 0)
+    ),
+    
+    Total_UnforcedErrors = cumsum(
+      ifelse(result == "Unforced Error", 1, 0)
+    )
+  ) %>%
+  ungroup()
+
+
+```
+
+
+
+```{r}
+bySet_progress <- bySet_raw %>%
+  group_by(set_id, team) %>%
+  mutate(
+    Attack_earnedPoints     = cumsum(skill %in% "Attack"    & result %in% "Point"),
+    Attack_UnforcedErrors   = cumsum(skill %in% "Attack"    & result %in% "Unforced Error"),
+    Serve_earnedPoints      = cumsum(skill %in% "Serve"     & result %in% "Point"),
+    Serve_UnforcedErrors    = cumsum(skill %in% "Serve"     & result %in% "Unforced Error"),
+    Block_earnedPoints      = cumsum(skill %in% "Block"     & result %in% "Point"),
+    Set_UnforcedErrors      = cumsum(skill %in% "Set"       & result %in% "Unforced Error"),
+    FreeBall_UnforcedErrors = cumsum(skill %in% "Free Ball" & result %in% "Unforced Error"),
+    Total_EarnedPoints      = cumsum(result %in% "Point"),
+    Total_UnforcedErrors    = cumsum(result %in% "Unforced Error")
+  ) %>%
+  ungroup()
+
+
+bySet_progress <- bySet_progress %>%
+  mutate(
+    score_diff = home_team_score - visiting_team_score,
+    points_played = home_team_score + visiting_team_score
+  )
+
+```
