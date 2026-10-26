@@ -8,52 +8,66 @@ format:
 ```{r}
 library(tidyverse)
 library(e1071)
-
-raw_conf_data <- read.csv("conference_matches_raw.csv")
-
-core_columns <- c(
-  "match_id", "set_number", "point_id", "file_line_number",
-  "home_team", "visiting_team", "team",
-  "skill", "evaluation_code", "evaluation", "special_code",
-  "point", "point_won_by", "winning_attack", "serving_team",
-  "home_team_score", "visiting_team_score",
-  "home_score_start_of_point", "visiting_score_start_of_point"
-)
-conference_data <- raw_conf_data |> select(all_of(core_columns))
-
-source("live_set_models.R")
+source("evaluation_functions.R")
+live <- load_model_data()
+table(live$meta$role)
 ```
 
 ```{r}
-x_train <- model.matrix(skill_formula, train_data)[, -1, drop = FALSE]
-x_test <- model.matrix(skill_formula, test_data)[, -1, drop = FALSE]
-stopifnot(nrow(x_train) == nrow(train_data), nrow(x_test) == nrow(test_data))
+nb_fit <- function(x, y, w) {
+  keep <- apply(x, 2, sd) > 0
+  list(model = naiveBayes(x[, keep, drop = FALSE], y), keep = keep)
+}
 
-varying <- apply(x_train, 2, sd) > 0
-x_train <- x_train[, varying, drop = FALSE]
-x_test <- x_test[, varying, drop = FALSE]
-
-x_train_scaled <- scale(x_train, center = colMeans(x_train), scale = apply(x_train, 2, sd))
-x_test_scaled <- scale(x_test, center = colMeans(x_train), scale = apply(x_train, 2, sd))
-y_train <- factor(train_data$home_set_win, levels = c(0, 1))
+nb_predict <- function(model, x) {
+  as.numeric(predict(model$model, x[, model$keep, drop = FALSE], type = "raw")[, "win"])
+}
 ```
 
 ```{r}
-nb_fit <- naiveBayes(x = x_train_scaled, y = y_train)
-nb_probability <- predict(nb_fit, x_test_scaled, type = "raw")[, "1"]
+cv_nb_skills <- cv_predictions(live, live$x_skills, nb_fit, nb_predict) |>
+  mutate(model = "naive_bayes", feature_set = "score_skills")
 
-nb_results <- test_data |>
-  mutate(
-    win_probability = nb_probability,
-    brier = (win_probability - home_set_win)^2,
-    clipped = pmin(pmax(win_probability, 1e-8), 1 - 1e-8),
-    log_loss = -(home_set_win * log(clipped) + (1 - home_set_win) * log(1 - clipped))
+cv_nb_score <- cv_predictions(live, live$x_score, nb_fit, nb_predict) |>
+  mutate(model = "naive_bayes", feature_set = "score")
+
+summary(cv_nb_skills$win_probability)
+```
+
+```{r}
+cv_other <- read_predictions() |>
+  filter(split == "cv", model != "naive_bayes")
+
+scores <- score_predictions(bind_rows(cv_other, cv_nb_skills, cv_nb_score), live$meta)
+scores$summary
+```
+
+```{r}
+scores$by_stage |> filter(model == "naive_bayes")
+```
+
+```{r}
+scores$calibration |> filter(model == "naive_bayes", feature_set == "score_skills")
+```
+
+```{r}
+cv_nb_skills |>
+  summarise(
+    below_5_percent = mean(win_probability < 0.05),
+    above_95_percent = mean(win_probability > 0.95)
   )
+```
 
-nb_summary <- nb_results |>
-  group_by(match_id, set_number) |>
-  summarise(brier = mean(brier), log_loss = mean(log_loss), .groups = "drop") |>
-  summarise(model = "naive_bayes", test_sets = n(), brier = mean(brier), log_loss = mean(log_loss))
+```{r}
+example <- cv_nb_skills |>
+  inner_join(live$meta, by = c("match_id", "set_number", "point_id")) |>
+  filter(match_id == match_id[1], set_number == set_number[1])
 
-bind_rows(nb_summary, model_comparison)
+ggplot(example, aes(x = rally_number, y = win_probability)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
+  labs(x = "Completed rallies",
+       y = "Probability CU wins the set",
+       title = "Naive Bayes predictions during a validation set") +
+  theme_minimal()
 ```
