@@ -71,3 +71,8 @@ ggplot(example, aes(x = rally_number, y = win_probability)) +
        title = "Naive Bayes predictions during a validation set") +
   theme_minimal()
 ```
+
+```{r}
+scores$summary |>
+  select(model, feature_set, brier, diff_vs_ref, diff_low, diff_high)
+```
