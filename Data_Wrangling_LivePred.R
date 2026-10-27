@@ -93,10 +93,10 @@ event_flags <- actions |>
     freeball_attempts = as.integer(skill %in% "Freeball"),
     freeball_errors = as.integer(skill %in% "Freeball" & evaluation_code %in% "="),
     # This is our provisional project definition, not a decoded special code.
-    unforced_errors = attack_errors + serve_errors,
+    unforced_errors = attack_errors + serve_errors + set_errors + freeball_errors,
     # Forced is provisional too; Block/= is not necessarily an illegal block.
     forced_error_actions = blocked_attacks + block_errors + dig_errors,
-    unclassified_errors = reception_errors + set_errors + freeball_errors,
+    unclassified_errors = reception_errors,
     # These are successful skill actions. NEVER add them to opponents' errors
     # to reconstruct points: an ace and a reception error can share one rally.
     winning_skill_actions = kills + aces + winning_blocks,
