@@ -96,3 +96,165 @@ step1$by_stage |>
   select(model, stage, brier) |>
   pivot_wider(names_from = stage, values_from = brier)
 ```
+
+## Step 2: Tuning
+
+The default forest grows leaves down to 10 rallies. Rallies from the same set
+share almost all of their inputs and the same outcome, so small leaves memorize
+individual sets rather than learning patterns that carry over to new seasons.
+We tune two settings:
+
+- `min.node.size`: the smallest leaf the forest will split. Larger leaves
+  average over more sets.
+- `mtry`: how many predictors each split may choose from. Smaller values force
+  the forest to use weaker predictors more often.
+
+We also try a third feature set, `score_skilldiff`: the score inputs plus the
+19 home-minus-away skill differences (e.g. CU kills minus opponent kills). It
+keeps the skill information in a smaller set of predictors.
+
+```{r}
+#| label: skilldiff-features
+home_cols <- grep("^home_", colnames(live$x_skills), value = TRUE)
+x_skilldiff <- live$x_skills[, home_cols] -
+  live$x_skills[, sub("^home_", "away_", home_cols)]
+colnames(x_skilldiff) <- sub("^home_", "diff_", home_cols)
+x_skilldiff <- cbind(live$x_score, x_skilldiff)
+
+feature_sets <- list(score = live$x_score, score_skills = live$x_skills,
+                     score_skilldiff = x_skilldiff)
+```
+
+Every combination is scored by season cross-validation. The grid uses 300 trees
+to save time and the set-averaged Brier score without intervals.
+
+```{r}
+#| label: tuning-grid
+rf_fit_with <- function(mtry, min_node, num_trees = 300) {
+  function(x, y, w) {
+    ranger(x = x, y = y, case.weights = w, probability = TRUE,
+           num.trees = num_trees, mtry = mtry, min.node.size = min_node,
+           seed = 4640)
+  }
+}
+
+cv_scores <- function(pred) {
+  add_losses(pred, live$meta) |>
+    group_by(match_id, set_number) |>
+    summarise(brier = mean(brier), log_loss = mean(log_loss), .groups = "drop") |>
+    summarise(brier = mean(brier), log_loss = mean(log_loss))
+}
+
+grid <- bind_rows(
+  expand_grid(feature_set = "score", mtry = 2:4,
+              min_node = c(10, 100, 400, 800, 1200, 1600, 2400)),
+  expand_grid(feature_set = "score_skills", mtry = c(6, 14, 28, 42),
+              min_node = c(100, 400, 800, 1600, 2400)),
+  expand_grid(feature_set = "score_skilldiff", mtry = c(4, 12, 23),
+              min_node = c(400, 1600, 2400))
+)
+
+tuning <- grid |>
+  mutate(scores = pmap(list(feature_set, mtry, min_node), function(fs, m, n) {
+    cv_predictions(live, feature_sets[[fs]], rf_fit_with(m, n), rf_predict) |>
+      cv_scores()
+  })) |>
+  unnest(scores)
+```
+
+Leaf size matters most. CV Brier score by leaf size, for the best `mtry` at
+each size:
+
+```{r}
+#| label: tuning-leaf-size
+tuning |>
+  group_by(feature_set, min_node) |>
+  summarise(brier = min(brier), .groups = "drop") |>
+  ggplot(aes(min_node, brier, colour = feature_set)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0.158, linetype = "dashed") +
+  scale_x_log10() +
+  labs(x = "Minimum leaf size (rallies, log scale)", y = "CV Brier score",
+       colour = "Features",
+       caption = "Dashed line: score-only logistic baseline") +
+  theme_minimal()
+```
+
+The best settings for each feature set:
+
+```{r}
+#| label: tuning-best
+best <- tuning |>
+  group_by(feature_set) |>
+  slice_min(brier, n = 1, with_ties = FALSE) |>
+  ungroup()
+best
+```
+
+These scores are slightly optimistic, because the settings were chosen on the
+same cross-validation folds they are scored on.
+
+## Step 3: Tuned forests
+
+Refit the best settings for each feature set with 500 trees and compare with
+the baselines, with intervals.
+
+```{r}
+#| label: rf-tuned-cv
+rf_tuned_cv <- best |>
+  pmap(function(feature_set, mtry, min_node, ...) {
+    cv_predictions(live, feature_sets[[feature_set]],
+                   rf_fit_with(mtry, min_node, num_trees = 500), rf_predict) |>
+      mutate(model = "random_forest", feature_set = feature_set)
+  }) |>
+  bind_rows()
+
+step3 <- score_predictions(bind_rows(baseline_cv, rf_tuned_cv), live$meta)
+step3$summary |>
+  select(model, feature_set, brier, log_loss, diff_vs_ref, diff_low, diff_high)
+```
+
+```{r}
+#| label: rf-tuned-stages
+step3$by_stage |>
+  mutate(model = paste(model, feature_set, sep = "__")) |>
+  select(model, stage, brier) |>
+  pivot_wider(names_from = stage, values_from = brier)
+```
+
+Which predictors does the tuned skills forest split on? Impurity importance
+measures how much each predictor reduces error across the forest's splits; it
+is a description of the fitted model, not a test.
+
+```{r}
+#| label: rf-importance
+skills_best <- filter(best, feature_set == "score_skills")
+train_rows <- live$meta$role == "train"
+importance_fit <- ranger(
+  x = live$x_skills[train_rows, ], y = live$y[train_rows],
+  case.weights = live$meta$set_weight[train_rows], probability = TRUE,
+  num.trees = 500, mtry = skills_best$mtry,
+  min.node.size = skills_best$min_node, importance = "impurity", seed = 4640
+)
+enframe(importance_fit$variable.importance, "predictor", "importance") |>
+  mutate(share = importance / sum(importance)) |>
+  arrange(desc(importance)) |>
+  head(10)
+```
+
+## Step 4: Save predictions
+
+Save the tuned forests in the standard format so `compare_models.R` includes
+them. `run_model()` also fits on all training seasons and predicts the test
+seasons; those predictions are saved but not examined here.
+
+```{r}
+#| label: rf-save
+best |>
+  pwalk(function(feature_set, mtry, min_node, ...) {
+    run_model(live, feature_sets[[feature_set]],
+              rf_fit_with(mtry, min_node, num_trees = 500), rf_predict) |>
+      save_predictions(model = "random_forest", feature_set = feature_set)
+  })
+```
