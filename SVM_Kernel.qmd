@@ -1,105 +1,107 @@
 ---
 title: "SVM_Kernel"
 format: pdf
+execute:
+  error: false
 ---
 
 ## Load the data
 
 ```{r}
-#Ensure that Data_Wrangling_LivePred.R is in your working directory
+# make sure to use the VolleyBuffs repo as the working directory for the following chunks or whatever works best on ur computer
+# Try this maybe?
+repo_root <- if (dir.exists("VolleyBuffs/R")) "VolleyBuffs" else "."
+knitr::opts_knit$set(root.dir = normalizePath(repo_root))
 library(e1071)
 ```
 
 ```{r}
-# Run the wrangling script. It creates the objects below in this R session.
-# It also saves copies under Data/derived; it does not split or fit models.
-source("R/Data_Wrangling_LivePred.R")
+# Run the wrangling script to have all the whatnot needed. All the wrangling and cleaning is handled in that script not in here
+source("R/make_splits.R")
 ```
 
 The script creates two data frames containing the same rally observations:
 `score_only` and `score_plus_skills`. These include identifiers and the outcome,
-so we should not pass every column directly to a model.
+so we should not pass every column directly to the models.
 
 It also creates numeric predictor matrices: `x_score` and `x_skills`.
-The separate factor `y` contains the home team's eventual `loss` or `win`.
-The starting skill matrix uses cumulative counts; rates remain available in
+The separate factor `y` contains the home team's (which is CU) eventual `loss` or `win`.
+The starting skill matrix uses cumulative counts and the rates remain available in
 the larger data frame for later selection and preprocessing.
 
-```{r,echo=FALSE,message=FALSE}
-
-# Dimensions are number of rally snapshots by number of predictor columns.
-dim(x_score)
-dim(x_skills)
-```
-
-## Prepare for the training/test split
+## Preparing the training/test split
 
 ```{r,echo=FALSE,message=FALSE}
-
-# Choose scores plus skills for this SVM; use x_score for the score-only model.
-svm_x <- x_skills
-svm_y <- y
-
-# Keep match IDs alongside the inputs so entire matches stay in one partition.
-# Do not include these IDs as SVM predictors.
+# wanna have match IDs alongside the inputs so entire matches stay together
+# don't wanna have these as predictors as they identify matches, not performance
 match_ids <- score_plus_skills$match_id
 ```
 
 
 ```{r}
-# Make the random selection reproducible.
-set.seed(303)
+set.seed(303) # favorite seed and makes it reproducible
 
-# List each match once, in a consistent order.
-matches <- sort(unique(score_only$match_id))
+# List each match once, in a consistent order
+matches <- sort(unique(match_ids))
 
-# Randomly reserve approximately 20% of matches for testing.
+# Setting aside 20% of matches for testing for an 80/20 training/testing split
 test_matches <- sample(
   matches,
   size = ceiling(0.20 * length(matches))
 )
 
-# Identify the rows belonging to those matches.
-# Both predictor matrices have exactly the same row order.
-is_test <- score_only$match_id %in% test_matches
+# We'll identify the rows being used for the testing
+# both predictor matrices have exactly the same row order for consistency
+is_test <- match_ids %in% test_matches
 
-# Score-only inputs.
+# score-only inputs.
 x_score_train <- x_score[!is_test, , drop = FALSE]
 x_score_test  <- x_score[is_test, , drop = FALSE]
 
-# Score-plus-skills inputs: use the SAME row selection.
+# score-plus-skills inputs will also use the same ids as score only
 x_skills_train <- x_skills[!is_test, , drop = FALSE]
 x_skills_test  <- x_skills[is_test, , drop = FALSE]
 
-# Both models use the same outcome labels.
+# making sure to pick the ids that aren't part of the testing
 y_train <- y[!is_test]
 y_test  <- y[is_test]
 ```
 
+
+## Model Creation
+Here we establish each model and will tune soon
+
 ```{r}
-# This will fit the score-only model
+# The seed also makes the probability-estimation step reproducible for the future
+set.seed(4640)
+# This is the score only model
 svm_score <- svm(
   x = x_score_train,        # this uses the training predictors
-  y = y_train,              # the y training has the known win/loss outcom
+  y = y_train,              # the y training has the known win/loss outcome
   type = "C-classification",
   kernel = "radial",         # RBF is a good standard
   cost = 5,                  # will tune this later
-  scale = TRUE              # Learn scaling from training inputs
+  gamma = 1 / ncol(x_score_train), # This the default, will tune later.
+  probability = TRUE,       # estimating probabilities too
+  scale = TRUE              # this is for creating a standardization for each predictor rather than having outliers overpowering relationships
 )
 
-# Fitting the score-plus-skills model with same training as the previous but with skills
+# No we are fitting the score-plus-skills model with same training as the previous but with skills
+set.seed(4640)
 svm_skills <- svm(
   x = x_skills_train,
-  y = y_train,              # Making sure to use the same outcomes and training observations as to not compare different things
+  y = y_train,              # Ensuring we use the same outcomes and training observations as to not compare different things
   type = "C-classification",
   kernel = "radial",
   cost = 5,
+  gamma = 1 / ncol(x_skills_train), # Same default rule, different number of inputs
+  probability = TRUE,
   scale = TRUE
 )
 
 # this will see how the models predicted
-pred_score <- predict(svm_score, newdata = x_score_test) 
-pred_skills <- predict(svm_skills, newdata = x_skills_test)
+pred_score <- predict(svm_score, newdata = x_score_test, probability = TRUE)
+pred_skills <- predict(svm_skills, newdata = x_skills_test, probability = TRUE)
 
 # Confusing mat or something
 table(Actual = y_test, Predicted = pred_score)
@@ -107,9 +109,53 @@ table(Actual = y_test, Predicted = pred_skills)
 
 # Fraction of the test set snapshot accurately identified
 mean(pred_score == y_test)
-mean(pred_skills == y_test) # the skills one did perform worse than the score only #For kernel = RBF, and 
+mean(pred_skills == y_test) # Compare these runs, but this is not the final tuned result
 ```
 
 
 
 
+
+## Comparing probabilities
+
+The accuracy above weights each rally equally. Here I average within each set
+first, so a longer set doesn't dominate the comparison. Lower Brier score and
+log loss are better. These probabilities do not require a classification threshold.
+
+```{r}
+# Get the probability of a HOME win by class name, not column position.
+p_score <- attr(pred_score, "probabilities")[, "win"]
+p_skills <- attr(pred_skills, "probabilities")[, "win"]
+
+# Keep the same held-out set identifiers for both models.
+results <- score_only[is_test, c("match_id", "set_number")] |>
+  mutate(actual_win = as.integer(y_test == "win"),
+         score_only = p_score, score_plus_skills = p_skills) |>
+  pivot_longer(c(score_only, score_plus_skills),
+               names_to = "model", values_to = "probability") |>
+  mutate(brier = (probability - actual_win)^2,
+         # Avoid taking log(0) for probabilities at the extremes.
+         clipped = pmin(pmax(probability, 1e-8), 1 - 1e-8),
+         log_loss = -(actual_win * log(clipped) +
+                        (1 - actual_win) * log(1 - clipped)))
+
+model_comparison <- results |>
+  group_by(model, match_id, set_number) |>
+  summarise(brier = mean(brier), log_loss = mean(log_loss), .groups = "drop") |>
+  group_by(model) |>
+  summarise(test_sets = n(), brier = mean(brier), log_loss = mean(log_loss),
+            .groups = "drop")
+model_comparison
+```
+
+These are preliminary comparisons. Both models use cost 5 and the default gamma
+rule (1 divided by the number of inputs), so their gamma values differ. Neither
+has been tuned. Later tuning needs match-grouped folds within training data;
+the held-out test matches should not guide parameter choices.
+
+The package's built-in probability estimation uses internal cross-validation
+that does not enforce match groups. It stays within the training data, but its
+probability calibration is preliminary because rallies from a match are related.
+Also, fitting here weights rally snapshots equally; the evaluation above gives
+sets equal weight. The class predictions shown earlier come from the SVM decision
+rule and need not match a 0.5 threshold on the estimated probabilities.
