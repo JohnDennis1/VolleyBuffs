@@ -124,6 +124,15 @@ p_calib
 ggsave("figures/calibration.png", p_calib, width = 6, height = 4.5, dpi = 300)
 ```
 
+```{r}
+dir.create("results", showWarnings = FALSE)
+write.csv(scores$summary, "results/naive_bayes_cv_summary.csv", row.names = FALSE)
+write.csv(filter(scores$by_stage, model == "naive_bayes"),
+          "results/naive_bayes_cv_by_stage.csv", row.names = FALSE)
+write.csv(filter(scores$calibration, model == "naive_bayes"),
+          "results/naive_bayes_cv_calibration.csv", row.names = FALSE)
+```
+
 ```{}
 ```
 

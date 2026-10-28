@@ -1,0 +1,9 @@
+"model","feature_set","split","stage","sets","brier"
+"naive_bayes","score","cv","Early (1-15 points)",288,0.224443553347674
+"naive_bayes","score","cv","Middle (16-30 points)",288,0.158594092515032
+"naive_bayes","score","cv","Late (31+ points)",287,0.103402631655155
+"naive_bayes","score","cv","Fifth set",10,0.589029612958013
+"naive_bayes","score_skills","cv","Early (1-15 points)",288,0.265246564809577
+"naive_bayes","score_skills","cv","Middle (16-30 points)",288,0.208715591711524
+"naive_bayes","score_skills","cv","Late (31+ points)",287,0.136311750254762
+"naive_bayes","score_skills","cv","Fifth set",10,0.598376044294093
