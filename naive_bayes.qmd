@@ -76,3 +76,65 @@ ggplot(example, aes(x = rally_number, y = win_probability)) +
 scores$summary |>
   select(model, feature_set, brier, diff_vs_ref, diff_low, diff_high)
 ```
+
+```{r}
+tab <- scores$summary |>
+  mutate(
+    Model = paste(model, feature_set, sep = " / "),
+    Brier = sprintf("%.3f", brier),
+    LogLoss = sprintf("%.3f", log_loss),
+    Difference = if_else(model == "logistic" & feature_set == "score", "reference",
+                         sprintf("%.3f (%.3f, %.3f)", diff_vs_ref, diff_low, diff_high))
+  ) |>
+  select(Model, Brier, LogLoss, Difference)
+
+cat(knitr::kable(tab, format = "latex", booktabs = TRUE), sep = "\n")
+```
+
+```{r}
+dir.create("figures", showWarnings = FALSE)
+
+p_brier <- scores$summary |>
+  mutate(label = paste(model, feature_set, sep = ": ")) |>
+  ggplot(aes(x = brier, y = reorder(label, -brier))) +
+  geom_pointrange(aes(xmin = brier_low, xmax = brier_high)) +
+  labs(x = "Brier score (lower is better)", y = NULL,
+       title = "Cross-validated Brier score with 95% intervals") +
+  theme_minimal()
+
+p_brier
+ggsave("figures/brier_intervals.png", p_brier, width = 6, height = 3.5, dpi = 300)
+```
+
+```{r}
+p_calib <- scores$calibration |>
+  filter((model == "naive_bayes" & feature_set == "score_skills") |
+           (model == "logistic" & feature_set == "score")) |>
+  mutate(label = paste(model, feature_set, sep = ": ")) |>
+  ggplot(aes(x = predicted, y = observed, color = label)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_line() +
+  geom_point() +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "Predicted probability", y = "Observed win rate", color = NULL,
+       title = "Calibration") +
+  theme_minimal()
+
+p_calib
+ggsave("figures/calibration.png", p_calib, width = 6, height = 4.5, dpi = 300)
+```
+
+```{}
+```
+
+```{}
+```
+
+```{}
+```
+
+```{}
+```
+
+```{}
+```
