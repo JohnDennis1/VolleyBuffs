@@ -5,11 +5,14 @@
 #   base_rate__none        Training share of sets CU won; ignores the game state.
 #   logistic__score        Score difference x total points, next server, fifth set.
 #   logistic__score_skills Score inputs plus the 38 cumulative skill counts.
+#   logistic__score_rates  Score inputs plus home-minus-away skill rates
+#                          (see rate_features.R).
 #
 # A model that cannot beat logistic__score is not using the skill information
 # usefully. These also serve as a template for adding a new model.
 
 source("evaluation_functions.R")
+source("rate_features.R")
 live <- load_model_data()
 
 # Weighted mean of y: with set weights, this is the share of sets CU won.
@@ -43,3 +46,6 @@ run_model(live, live$x_score, logistic_fit, logistic_predict) |>
   save_predictions(model = "logistic", feature_set = "score")
 run_model(live, live$x_skills, logistic_fit, logistic_predict) |>
   save_predictions(model = "logistic", feature_set = "score_skills")
+run_model(live, rate_features(live), impute_means(logistic_fit),
+          impute_means_predict(logistic_predict)) |>
+  save_predictions(model = "logistic", feature_set = "score_rates")

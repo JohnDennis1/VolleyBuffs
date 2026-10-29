@@ -258,3 +258,87 @@ best |>
       save_predictions(model = "random_forest", feature_set = feature_set)
   })
 ```
+
+## Step 5: Rate features
+
+Steps 1–4 used raw skill counts. Here the skill inputs are home-minus-away
+*rates* instead (kill %, ace %, sideout %, ...), built by `rate_features.R`:
+the four score inputs, 13 rate differences, and total attack attempts so the
+forest can tell how many attempts a rate rests on. A rate difference is
+missing until both teams have attempted that skill; `impute_means()` fills it
+with the mean from the fitting seasons only.
+
+The question is whether `score_rates` beats `score`, so it is tuned on the same
+kind of grid and compared with the tuned score-only forest and both logistic
+models.
+
+```{r}
+#| label: rates-grid
+source("rate_features.R")
+x_rates <- rate_features(live)
+
+rates_tuning <- expand_grid(mtry = c(2, 4, 6, 9, 13, 18),
+                            min_node = c(400, 800, 1600, 2400)) |>
+  mutate(scores = pmap(list(mtry, min_node), function(m, n) {
+    cv_predictions(live, x_rates, impute_means(rf_fit_with(m, n)),
+                   impute_means_predict(rf_predict)) |>
+      cv_scores()
+  })) |>
+  unnest(scores)
+
+rates_best <- slice_min(rates_tuning, brier, n = 1, with_ties = FALSE)
+arrange(rates_tuning, brier) |> head(8)
+```
+
+```{r}
+#| label: rates-cv
+rf_rates_cv <- cv_predictions(
+  live, x_rates,
+  impute_means(rf_fit_with(rates_best$mtry, rates_best$min_node, num_trees = 500)),
+  impute_means_predict(rf_predict)
+) |>
+  mutate(model = "random_forest", feature_set = "score_rates")
+
+step5 <- score_predictions(
+  bind_rows(read_predictions() |>
+              filter(split == "cv",
+                     paste(model, feature_set) %in%
+                       c("logistic score", "logistic score_rates",
+                         "random_forest score")),
+            rf_rates_cv),
+  live$meta)
+step5$summary |>
+  select(model, feature_set, brier, log_loss, diff_vs_ref, diff_low, diff_high)
+```
+
+```{r}
+#| label: rates-stages
+step5$by_stage |>
+  mutate(model = paste(model, feature_set, sep = "__")) |>
+  select(model, stage, brier) |>
+  pivot_wider(names_from = stage, values_from = brier)
+```
+
+Which rates does the forest use?
+
+```{r}
+#| label: rates-importance
+rates_fit <- impute_means(function(x, y, w) {
+  ranger(x = x, y = y, case.weights = w, probability = TRUE, num.trees = 500,
+         mtry = rates_best$mtry, min.node.size = rates_best$min_node,
+         importance = "impurity", seed = 4640)
+})(x_rates[train_rows, ], live$y[train_rows], live$meta$set_weight[train_rows])
+enframe(rates_fit$model$variable.importance, "predictor", "importance") |>
+  mutate(share = importance / sum(importance)) |>
+  arrange(desc(importance)) |>
+  head(10)
+```
+
+```{r}
+#| label: rates-save
+run_model(live, x_rates,
+          impute_means(rf_fit_with(rates_best$mtry, rates_best$min_node,
+                                   num_trees = 500)),
+          impute_means_predict(rf_predict)) |>
+  save_predictions(model = "random_forest", feature_set = "score_rates")
+```

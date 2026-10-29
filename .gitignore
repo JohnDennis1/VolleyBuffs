@@ -6,3 +6,4 @@ Data/
 *.html
 .DS_Store
 predictions/comparison_*.csv
+__pycache__/
